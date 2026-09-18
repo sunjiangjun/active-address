@@ -407,7 +407,9 @@ export default function App() {
 
             <div className="grid gap-4">
               <label className="grid gap-2 text-sm">
-                <span className="text-slate-300">{t(locale, "privateKey")}</span>
+                <span className="text-slate-300">
+                  {t(locale, "privateKey")} <span className="text-rose-400">*</span>
+                </span>
                 <div className="relative">
                   <input
                     className="w-full rounded-xl border border-white/10 bg-ink-950 px-3 py-2.5 pr-11 font-mono text-sm outline-none ring-accent/40 placeholder:text-slate-600 focus:ring-2"
@@ -449,7 +451,9 @@ export default function App() {
 
               <div className="grid gap-4 sm:grid-cols-2">
                 <label className="grid gap-2 text-sm">
-                  <span className="text-slate-300">{t(locale, "maxSpend")}</span>
+                  <span className="text-slate-300">
+                    {t(locale, "maxSpend")} <span className="text-rose-400">*</span>
+                  </span>
                   <input
                     className="rounded-xl border border-white/10 bg-ink-950 px-3 py-2.5 outline-none ring-accent/40 placeholder:text-slate-600 focus:ring-2"
                     inputMode="decimal"
@@ -463,7 +467,9 @@ export default function App() {
                   />
                 </label>
                 <label className="grid gap-2 text-sm">
-                  <span className="text-slate-300">{t(locale, "addressCount")}</span>
+                  <span className="text-slate-300">
+                    {t(locale, "addressCount")} <span className="text-rose-400">*</span>
+                  </span>
                   <input
                     className="rounded-xl border border-white/10 bg-ink-950 px-3 py-2.5 outline-none ring-accent/40 placeholder:text-slate-600 focus:ring-2"
                     inputMode="numeric"
