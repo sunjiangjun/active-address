@@ -29,6 +29,18 @@ export function walletFromPrivateKey(privateKey: string): Wallet {
   return new Wallet(normalizePrivateKey(privateKey));
 }
 
+export function gasReserveWei(): bigint {
+  return parseEther(String(QDAY_CHAIN.gasReserveQday));
+}
+
+export function requiredBalanceForTx(value: bigint): bigint {
+  return value + gasReserveWei();
+}
+
+export function isLowBalance(balanceWei: bigint | null): boolean {
+  return balanceWei != null && balanceWei < gasReserveWei();
+}
+
 export async function fetchSenderState(privateKey: string): Promise<{
   address: string;
   balanceWei: bigint;
@@ -44,21 +56,24 @@ export async function fetchSenderState(privateKey: string): Promise<{
   };
 }
 
-export function assertSpendableBalance(balanceWei: bigint, maxSpendQday: string): void {
-  const spendWei = parseEther(maxSpendQday);
-  const reserveWei = parseEther(String(QDAY_CHAIN.gasReserveQday));
-  const required = spendWei + reserveWei;
+export function collectUniquePrivateKeys(privateKeys: string[]): string[] {
+  const unique: string[] = [];
+  const seen = new Set<string>();
 
-  if (balanceWei < required) {
-    const have = formatEther(balanceWei);
-    const need = formatEther(required);
-    throw new AppError("insufficientBalance", {
-      have,
-      need,
-      spend: maxSpendQday,
-      reserve: String(QDAY_CHAIN.gasReserveQday),
-    });
+  for (const raw of privateKeys) {
+    if (!raw.trim()) continue;
+    try {
+      const normalized = normalizePrivateKey(raw);
+      const address = new Wallet(normalized).address.toLowerCase();
+      if (seen.has(address)) continue;
+      seen.add(address);
+      unique.push(normalized);
+    } catch {
+      continue;
+    }
   }
+
+  return unique;
 }
 
 export type TransferItem = {
@@ -69,9 +84,10 @@ export type TransferItem = {
 export type TransferProgress = {
   index: number;
   to: string;
+  from?: string;
   value: bigint;
   hash?: string;
-  error?: string;
+  error?: unknown;
   status: "sent" | "failed";
 };
 
@@ -90,19 +106,33 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
+function pickRandom<T>(items: T[]): T {
+  return items[Math.floor(Math.random() * items.length)];
+}
+
 export async function runSequentialTransfers(options: {
-  privateKey: string;
+  privateKeys: string[];
   transfers: TransferItem[];
   intervalMs: number;
   signal: AbortSignal;
   onProgress: (update: TransferProgress) => void;
 }): Promise<void> {
-  const { privateKey, transfers, intervalMs, signal, onProgress } = options;
-  const provider = createProvider();
-  const wallet = walletFromPrivateKey(privateKey).connect(provider);
+  const { privateKeys, transfers, intervalMs, signal, onProgress } = options;
+  const uniqueKeys = collectUniquePrivateKeys(privateKeys);
+  if (uniqueKeys.length === 0) {
+    throw new AppError("needPrivateKey");
+  }
 
-  let nonce = await wallet.getNonce("pending");
+  const provider = createProvider();
+  const wallets = uniqueKeys.map((key) => walletFromPrivateKey(key).connect(provider));
+  const nonces = new Map<string, number>();
   const feeData = await provider.getFeeData();
+  const feeFields = feeData.maxFeePerGas
+    ? {
+        maxFeePerGas: feeData.maxFeePerGas,
+        maxPriorityFeePerGas: feeData.maxPriorityFeePerGas ?? 1n,
+      }
+    : { gasPrice: feeData.gasPrice ?? undefined };
 
   for (let index = 0; index < transfers.length; index += 1) {
     if (signal.aborted) {
@@ -110,38 +140,59 @@ export async function runSequentialTransfers(options: {
     }
 
     const item = transfers[index];
+    const wallet = pickRandom(wallets);
+    const from = wallet.address;
+
     try {
-      const tx = await wallet.sendTransaction({
-        to: item.to,
-        value: item.value,
-        nonce,
-        gasLimit: 21_000n,
-        chainId: QDAY_CHAIN.chainId,
-        ...(feeData.maxFeePerGas
-          ? {
-              maxFeePerGas: feeData.maxFeePerGas,
-              maxPriorityFeePerGas: feeData.maxPriorityFeePerGas ?? 1n,
-            }
-          : { gasPrice: feeData.gasPrice ?? undefined }),
-      });
-      nonce += 1;
-      onProgress({
-        index,
-        to: item.to,
-        value: item.value,
-        hash: tx.hash,
-        status: "sent",
-      });
+      const balance = await provider.getBalance(from);
+      const required = requiredBalanceForTx(item.value);
+      if (balance < required) {
+        onProgress({
+          index,
+          to: item.to,
+          from,
+          value: item.value,
+          status: "failed",
+          error: new AppError("senderInsufficient", {
+            address: from,
+            have: formatEther(balance),
+            need: formatEther(required),
+            reserve: String(QDAY_CHAIN.gasReserveQday),
+          }),
+        });
+      } else {
+        if (!nonces.has(from)) {
+          nonces.set(from, await wallet.getNonce("pending"));
+        }
+        const nonce = nonces.get(from)!;
+        const tx = await wallet.sendTransaction({
+          to: item.to,
+          value: item.value,
+          nonce,
+          gasLimit: 21_000n,
+          chainId: QDAY_CHAIN.chainId,
+          ...feeFields,
+        });
+        nonces.set(from, nonce + 1);
+        onProgress({
+          index,
+          to: item.to,
+          from,
+          value: item.value,
+          hash: tx.hash,
+          status: "sent",
+        });
+      }
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+      nonces.delete(from);
       onProgress({
         index,
         to: item.to,
+        from,
         value: item.value,
-        error: message,
+        error,
         status: "failed",
       });
-      throw error;
     }
 
     if (index < transfers.length - 1) {

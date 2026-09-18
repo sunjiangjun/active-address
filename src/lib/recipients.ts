@@ -12,7 +12,7 @@ export type RecipientPlan = {
 
 export function parseSpecifiedAddresses(input: string): string[] {
   const parts = input
-    .split(/[\s,，;；|]+/)
+    .split(/\r?\n/)
     .map((part) => part.trim())
     .filter(Boolean);
 

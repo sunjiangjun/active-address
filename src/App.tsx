@@ -7,7 +7,9 @@ import {
   Eye,
   EyeOff,
   Loader2,
+  Minus,
   Play,
+  Plus,
   Square,
   Wallet,
 } from "lucide-react";
@@ -24,8 +26,9 @@ import {
 import { QDAY_CHAIN } from "./lib/chain";
 import { buildRecipientPlan, splitValueRandom, type RecipientPlan } from "./lib/recipients";
 import {
-  assertSpendableBalance,
+  collectUniquePrivateKeys,
   fetchSenderState,
+  isLowBalance,
   runSequentialTransfers,
   type TransferProgress,
 } from "./lib/transfer";
@@ -33,6 +36,26 @@ import {
 type Phase = "idle" | "preparing" | "ready" | "running" | "done" | "stopped" | "failed";
 
 type LogItem = TransferProgress & { at: string };
+
+type KeyEntry = {
+  id: string;
+  privateKey: string;
+  address: string;
+  balanceWei: bigint | null;
+  balanceQday: string;
+  show: boolean;
+};
+
+function createKeyEntry(): KeyEntry {
+  return {
+    id: crypto.randomUUID(),
+    privateKey: "",
+    address: "",
+    balanceWei: null,
+    balanceQday: "",
+    show: false,
+  };
+}
 
 function shortAddress(address: string): string {
   return `${address.slice(0, 6)}…${address.slice(-4)}`;
@@ -128,14 +151,11 @@ function LanguageSwitch({
 
 export default function App() {
   const [locale, setLocale] = useState<Locale>(() => readLocale());
-  const [privateKey, setPrivateKey] = useState("");
-  const [showPrivateKey, setShowPrivateKey] = useState(false);
+  const [keyEntries, setKeyEntries] = useState<KeyEntry[]>(() => [createKeyEntry()]);
   const [maxSpend, setMaxSpend] = useState("");
   const [addressCount, setAddressCount] = useState("10");
   const [specifiedAddresses, setSpecifiedAddresses] = useState("");
 
-  const [senderAddress, setSenderAddress] = useState("");
-  const [senderBalance, setSenderBalance] = useState("");
   const [mnemonicBackupAck, setMnemonicBackupAck] = useState(false);
 
   const [phase, setPhase] = useState<Phase>("idle");
@@ -143,13 +163,14 @@ export default function App() {
   const [plan, setPlan] = useState<RecipientPlan | null>(null);
   const [perAmounts, setPerAmounts] = useState<bigint[]>([]);
   const [completed, setCompleted] = useState(0);
+  const [processed, setProcessed] = useState(0);
   const [logs, setLogs] = useState<LogItem[]>([]);
 
   const abortRef = useRef<AbortController | null>(null);
   const running = phase === "running";
   const total = plan?.recipients.length ?? 0;
-  const remaining = Math.max(total - completed, 0);
-  const percent = total === 0 ? 0 : Math.round((completed / total) * 100);
+  const remaining = Math.max(total - processed, 0);
+  const percent = total === 0 ? 0 : Math.round((processed / total) * 100);
 
   useEffect(() => {
     writeLocale(locale);
@@ -193,22 +214,46 @@ export default function App() {
     });
   }, [perAmounts, locale]);
 
-  async function loadSender() {
+  async function loadSender(id: string, privateKey: string) {
     if (!privateKey.trim()) {
-      setSenderAddress("");
-      setSenderBalance("");
+      setKeyEntries((entries) =>
+        entries.map((entry) =>
+          entry.id === id ? { ...entry, address: "", balanceWei: null, balanceQday: "" } : entry,
+        ),
+      );
       return;
     }
     try {
       const state = await fetchSenderState(privateKey);
-      setSenderAddress(state.address);
-      setSenderBalance(state.balanceQday);
+      setKeyEntries((entries) =>
+        entries.map((entry) =>
+          entry.id === id
+            ? {
+                ...entry,
+                address: state.address,
+                balanceWei: state.balanceWei,
+                balanceQday: state.balanceQday,
+              }
+            : entry,
+        ),
+      );
       setError(null);
     } catch (err) {
-      setSenderAddress("");
-      setSenderBalance("");
+      setKeyEntries((entries) =>
+        entries.map((entry) =>
+          entry.id === id ? { ...entry, address: "", balanceWei: null, balanceQday: "" } : entry,
+        ),
+      );
       setError(err);
     }
+  }
+
+  function addKeyEntry() {
+    setKeyEntries((entries) => [...entries, createKeyEntry()]);
+  }
+
+  function removeKeyEntry(id: string) {
+    setKeyEntries((entries) => (entries.length <= 1 ? entries : entries.filter((entry) => entry.id !== id)));
   }
 
   function resetPrepared() {
@@ -217,12 +262,14 @@ export default function App() {
     setPerAmounts([]);
     setMnemonicBackupAck(false);
     setCompleted(0);
+    setProcessed(0);
     setLogs([]);
     if (phase !== "idle") setPhase("idle");
   }
 
   async function buildPreparedState() {
-    if (!privateKey.trim()) {
+    const privateKeys = collectUniquePrivateKeys(keyEntries.map((entry) => entry.privateKey));
+    if (privateKeys.length === 0) {
       throw new AppError("needPrivateKey");
     }
     if (!maxSpend.trim()) {
@@ -235,31 +282,25 @@ export default function App() {
     const nextPlan = buildRecipientPlan(specifiedAddresses, count);
     const spendWei = parseEther(maxSpend.trim());
     const amounts = splitValueRandom(spendWei, nextPlan.recipients.length);
-    const state = await fetchSenderState(privateKey);
-    assertSpendableBalance(state.balanceWei, maxSpend.trim());
-    return { nextPlan, amounts, state };
+    return { nextPlan, amounts };
   }
 
-  function applyPreparedState(
-    nextPlan: RecipientPlan,
-    amounts: bigint[],
-    state: { address: string; balanceQday: string },
-  ) {
-    setSenderAddress(state.address);
-    setSenderBalance(state.balanceQday);
+  function applyPreparedState(nextPlan: RecipientPlan, amounts: bigint[]) {
     setPlan(nextPlan);
     setPerAmounts(amounts);
     setCompleted(0);
+    setProcessed(0);
     setLogs([]);
     setMnemonicBackupAck(!nextPlan.mnemonic);
+    setSpecifiedAddresses(nextPlan.recipients.join("\n"));
   }
 
   async function prepare() {
     setError(null);
     setPhase("preparing");
     try {
-      const { nextPlan, amounts, state } = await buildPreparedState();
-      applyPreparedState(nextPlan, amounts, state);
+      const { nextPlan, amounts } = await buildPreparedState();
+      applyPreparedState(nextPlan, amounts);
       setPhase("ready");
     } catch (err) {
       setPlan(null);
@@ -281,7 +322,7 @@ export default function App() {
         const prepared = await buildPreparedState();
         currentPlan = prepared.nextPlan;
         amounts = prepared.amounts;
-        applyPreparedState(currentPlan, amounts, prepared.state);
+        applyPreparedState(currentPlan, amounts);
       } catch (err) {
         setPlan(null);
         setPerAmounts([]);
@@ -299,13 +340,14 @@ export default function App() {
 
     const resumeFrom =
       (previousPhase === "stopped" || previousPhase === "failed") &&
-      completed > 0 &&
-      completed < currentPlan.recipients.length
-        ? completed
+      processed > 0 &&
+      processed < currentPlan.recipients.length
+        ? processed
         : 0;
 
     if (resumeFrom === 0) {
       setCompleted(0);
+      setProcessed(0);
       setLogs([]);
     }
     setPhase("running");
@@ -315,7 +357,7 @@ export default function App() {
 
     try {
       await runSequentialTransfers({
-        privateKey,
+        privateKeys: keyEntries.map((entry) => entry.privateKey),
         transfers: currentPlan.recipients.slice(resumeFrom).map((to, index) => ({
           to,
           value: amounts[resumeFrom + index],
@@ -328,6 +370,7 @@ export default function App() {
             index: resumeFrom + update.index,
             at: new Date().toLocaleTimeString(),
           };
+          setProcessed((value) => value + 1);
           if (update.status === "sent") {
             setCompleted((value) => value + 1);
           }
@@ -406,48 +449,91 @@ export default function App() {
             </div>
 
             <div className="grid gap-4">
-              <label className="grid gap-2 text-sm">
-                <span className="text-slate-300">
+              <div className="grid gap-3">
+                <span className="text-sm text-slate-300">
                   {t(locale, "privateKey")} <span className="text-rose-400">*</span>
                 </span>
-                <div className="relative">
-                  <input
-                    className="w-full rounded-xl border border-white/10 bg-ink-950 px-3 py-2.5 pr-11 font-mono text-sm outline-none ring-accent/40 placeholder:text-slate-600 focus:ring-2"
-                    type={showPrivateKey ? "text" : "password"}
-                    autoComplete="off"
-                    spellCheck={false}
-                    disabled={running}
-                    placeholder="0x…"
-                    value={privateKey}
-                    onChange={(event) => {
-                      setPrivateKey(event.target.value);
-                      resetPrepared();
-                    }}
-                    onBlur={() => void loadSender()}
-                  />
-                  <button
-                    type="button"
-                    className="absolute right-2 top-1/2 -translate-y-1/2 rounded-md p-1 text-slate-400 hover:text-white"
-                    onClick={() => setShowPrivateKey((value) => !value)}
-                  >
-                    {showPrivateKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
-                  </button>
-                </div>
-              </label>
-
-              {(senderAddress || senderBalance) && (
-                <div className="grid gap-1 rounded-xl border border-white/10 bg-black/20 px-3 py-2 font-mono text-xs text-slate-300">
-                  <div>
-                    {t(locale, "senderAddress")} {senderAddress || "—"}
-                  </div>
-                  <div>
-                    {t(locale, "currentBalance")} {senderBalance || "—"} QDAY
-                  </div>
-                  <div>
-                    {t(locale, "gasReserveHint", { reserve: QDAY_CHAIN.gasReserveQday })}
-                  </div>
-                </div>
-              )}
+                {keyEntries.map((entry) => {
+                  const low = isLowBalance(entry.balanceWei);
+                  return (
+                    <div key={entry.id} className="flex items-end gap-2">
+                      <div className="min-w-0 flex-1">
+                        {entry.address && (
+                          <div className={`mb-1.5 font-mono text-xs ${low ? "text-rose-400" : "text-slate-400"}`}>
+                            <div>
+                              {t(locale, "senderAddress")} {entry.address}
+                            </div>
+                            <div>
+                              {t(locale, "currentBalance")} {entry.balanceQday} QDAY
+                              {low
+                                ? ` · ${t(locale, "lowBalance", { reserve: QDAY_CHAIN.gasReserveQday })}`
+                                : ""}
+                            </div>
+                          </div>
+                        )}
+                        <div className="relative">
+                          <input
+                            className="w-full rounded-xl border border-white/10 bg-ink-950 px-3 py-2.5 pr-11 font-mono text-sm outline-none ring-accent/40 placeholder:text-slate-600 focus:ring-2"
+                            type={entry.show ? "text" : "password"}
+                            autoComplete="off"
+                            spellCheck={false}
+                            disabled={running}
+                            placeholder="0x…"
+                            value={entry.privateKey}
+                            onChange={(event) => {
+                              const value = event.target.value;
+                              setKeyEntries((entries) =>
+                                entries.map((item) =>
+                                  item.id === entry.id
+                                    ? { ...item, privateKey: value, address: "", balanceWei: null, balanceQday: "" }
+                                    : item,
+                                ),
+                              );
+                            }}
+                            onBlur={(event) => void loadSender(entry.id, event.target.value)}
+                          />
+                          <button
+                            type="button"
+                            className="absolute right-2 top-1/2 -translate-y-1/2 rounded-md p-1 text-slate-400 hover:text-white"
+                            onClick={() =>
+                              setKeyEntries((entries) =>
+                                entries.map((item) =>
+                                  item.id === entry.id ? { ...item, show: !item.show } : item,
+                                ),
+                              )
+                            }
+                          >
+                            {entry.show ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                          </button>
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        disabled={running}
+                        title={t(locale, "addPrivateKey")}
+                        className="flex h-[42px] w-[42px] shrink-0 items-center justify-center rounded-xl border border-white/10 bg-white/5 text-slate-200 hover:bg-white/10 disabled:opacity-50"
+                        onClick={addKeyEntry}
+                      >
+                        <Plus className="h-4 w-4" />
+                      </button>
+                      {keyEntries.length > 1 && (
+                        <button
+                          type="button"
+                          disabled={running}
+                          title={t(locale, "removePrivateKey")}
+                          className="flex h-[42px] w-[42px] shrink-0 items-center justify-center rounded-xl border border-white/10 bg-white/5 text-slate-200 hover:bg-white/10 disabled:opacity-50"
+                          onClick={() => removeKeyEntry(entry.id)}
+                        >
+                          <Minus className="h-4 w-4" />
+                        </button>
+                      )}
+                    </div>
+                  );
+                })}
+                <p className="text-xs leading-5 text-slate-500">
+                  {t(locale, "gasReserveHint", { reserve: QDAY_CHAIN.gasReserveQday })}
+                </p>
+              </div>
 
               <div className="grid gap-4 sm:grid-cols-2">
                 <label className="grid gap-2 text-sm">
@@ -487,9 +573,9 @@ export default function App() {
               <label className="grid gap-2 text-sm">
                 <span className="text-slate-300">{t(locale, "specifiedAddresses")}</span>
                 <textarea
-                  className="min-h-28 rounded-xl border border-white/10 bg-ink-950 px-3 py-2.5 font-mono text-xs outline-none ring-accent/40 placeholder:text-slate-600 focus:ring-2"
+                  className="min-h-40 rounded-xl border border-white/10 bg-ink-950 px-3 py-2.5 font-mono text-xs outline-none ring-accent/40 placeholder:text-slate-600 focus:ring-2"
                   disabled={running}
-                  placeholder="0xabc...,0xdef..."
+                  placeholder={"0xabc...\n0xdef..."}
                   value={specifiedAddresses}
                   onChange={(event) => {
                     setSpecifiedAddresses(event.target.value);
@@ -599,30 +685,6 @@ export default function App() {
               </div>
             )}
 
-            <div className="rounded-3xl border border-white/10 bg-ink-900/70 p-5">
-              <div className="flex items-center justify-between">
-                <h2 className="text-sm font-medium text-slate-200">{t(locale, "recipients")}</h2>
-                {plan && (
-                  <span className="text-xs text-slate-500">
-                    {t(locale, "specifiedGenerated", {
-                      specified: plan.specified.length,
-                      generated: plan.generated.length,
-                    })}
-                  </span>
-                )}
-              </div>
-              <div className="mono-scroll mt-3 max-h-48 overflow-auto rounded-xl border border-white/10 bg-black/20 p-3 font-mono text-xs leading-6 text-slate-300">
-                {plan ? (
-                  plan.recipients.map((address, index) => (
-                    <div key={`${address}-${index}`}>
-                      {index + 1}. {address}
-                    </div>
-                  ))
-                ) : (
-                  <span className="text-slate-600">{t(locale, "recipientsEmpty")}</span>
-                )}
-              </div>
-            </div>
           </section>
         </div>
 
@@ -634,6 +696,7 @@ export default function App() {
                 <tr>
                   <th className="px-3 py-2 font-medium">{t(locale, "time")}</th>
                   <th className="px-3 py-2 font-medium">#</th>
+                  <th className="px-3 py-2 font-medium">{t(locale, "sender")}</th>
                   <th className="px-3 py-2 font-medium">{t(locale, "recipient")}</th>
                   <th className="px-3 py-2 font-medium">{t(locale, "amount")}</th>
                   <th className="px-3 py-2 font-medium">{t(locale, "status")}</th>
@@ -643,15 +706,16 @@ export default function App() {
               <tbody>
                 {logs.length === 0 ? (
                   <tr>
-                    <td className="px-3 py-4 text-slate-600" colSpan={6}>
+                    <td className="px-3 py-4 text-slate-600" colSpan={7}>
                       {t(locale, "logEmpty")}
                     </td>
                   </tr>
                 ) : (
                   logs.map((item) => (
-                    <tr key={`${item.index}-${item.hash ?? item.error}`} className="border-t border-white/5">
+                    <tr key={`${item.index}-${item.hash ?? item.status}-${item.from ?? ""}`} className="border-t border-white/5">
                       <td className="px-3 py-2 text-slate-500">{item.at}</td>
                       <td className="px-3 py-2">{item.index + 1}</td>
+                      <td className="px-3 py-2">{item.from ? <AddressHover address={item.from} /> : "—"}</td>
                       <td className="px-3 py-2">
                         <AddressHover address={item.to} />
                       </td>
@@ -670,7 +734,7 @@ export default function App() {
                             {shortAddress(item.hash)}
                           </a>
                         ) : (
-                          item.error
+                          formatError(locale, item.error)
                         )}
                       </td>
                     </tr>
