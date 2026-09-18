@@ -1,0 +1,43 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  background:
+    radial-gradient(1200px 500px at 10% -10%, rgba(123, 147, 255, 0.16), transparent 55%),
+    radial-gradient(900px 420px at 100% 0%, rgba(56, 189, 248, 0.08), transparent 50%),
+    #05080f;
+  color: #e8edf8;
+}
+
+::selection {
+  background: #7b93ff;
+  color: #05080f;
+}
+
+input,
+textarea,
+button {
+  font: inherit;
+}
+
+.mono-scroll::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.mono-scroll::-webkit-scrollbar-thumb {
+  background: #243354;
+  border-radius: 999px;
+}
